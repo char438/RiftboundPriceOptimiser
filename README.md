@@ -129,5 +129,4 @@ accordingly, and don't hammer it.
 
 ## License
 
-Not yet licensed. Add one (MIT is a reasonable default for a project
-like this) when you publish it.
+MIT, see [LICENSE](LICENSE).
