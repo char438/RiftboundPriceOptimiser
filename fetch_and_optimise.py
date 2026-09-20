@@ -76,6 +76,7 @@ within each source (see sources/util.py).
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -106,7 +107,11 @@ def fetch_everything(want: Dict[str, int]) -> tuple:
     return listings, sellers
 
 
-def _dump(path: str, listings: List[Listing], sellers: List[Seller]) -> None:
+CACHE_TTL = 3600  # seconds a card's cached listings are trusted before re-fetching
+
+
+def _dump(path: str, listings: List[Listing], sellers: List[Seller],
+          fetched_at: Dict[str, float]) -> None:
     payload = {
         "listings": [l.__dict__ for l in listings],
         "sellers": [
@@ -117,6 +122,7 @@ def _dump(path: str, listings: List[Listing], sellers: List[Seller]) -> None:
              "url": s.url}
             for s in sellers
         ],
+        "fetched_at": fetched_at,
     }
     Path(path).write_text(json.dumps(payload, indent=2))
     print(f"\nwrote {path}")
@@ -135,7 +141,22 @@ def _load_offline(path: str) -> tuple:
                               minimum_order=s.get("minimum_order", 0.0),
                               shipping_tiers=tiers,
                               url=s.get("url")))
-    return listings, sellers
+    return listings, sellers, raw.get("fetched_at", {})
+
+
+def merge_cache(cached_listings: List[Listing], cached_sellers: List[Seller],
+                fetched_at: Dict[str, float], stale_cards: set,
+                fresh_listings: List[Listing], fresh_sellers: List[Seller],
+                now: float) -> tuple:
+    """Drop cached listings for cards we just re-fetched, add the fresh
+    ones, and union sellers (by name, fresh data wins). Pure function so
+    it's testable without hitting the network -- see test_cache.py."""
+    listings = [l for l in cached_listings if l.card not in stale_cards] + fresh_listings
+    seller_map = {s.name: s for s in cached_sellers}
+    seller_map.update({s.name: s for s in fresh_sellers})
+    fetched_at = dict(fetched_at)
+    fetched_at.update({card: now for card in stale_cards})
+    return listings, list(seller_map.values()), fetched_at
 
 
 def _resolve_want(args) -> Dict[str, int]:
@@ -215,6 +236,8 @@ def main() -> None:
                          "cheapest-overall plan (which isn't capped)")
     ap.add_argument("--offline", metavar="FILE",
                     help="skip fetching, re-parse a previous --dump file")
+    ap.add_argument("--refresh", action="store_true",
+                    help="ignore the cache, re-fetch every card")
     ap.add_argument("--no-sweep", action="store_true",
                     help="skip printing the cost-vs-orders tradeoff table "
                          "(the cheapest-overall plan is still found from it)")
@@ -229,7 +252,8 @@ def main() -> None:
     want = None if players else _resolve_want(args)
 
     run(want=want, players=players, offline=args.offline, dump=args.dump,
-        max_sellers=args.max_sellers, sweep_to=args.sweep_to, no_sweep=args.no_sweep)
+        max_sellers=args.max_sellers, sweep_to=args.sweep_to, no_sweep=args.no_sweep,
+        refresh=args.refresh)
 
 
 def run(want: Optional[Dict[str, int]] = None,
@@ -238,12 +262,20 @@ def run(want: Optional[Dict[str, int]] = None,
         dump: str = "listings_cache.json",
         max_sellers: Optional[int] = None,
         sweep_to: int = 15,
-        no_sweep: bool = False) -> None:
+        no_sweep: bool = False,
+        refresh: bool = False) -> None:
     """The actual pipeline, factored out of main() so a GUI (see ui.py) or
     any other caller can drive it directly with plain Python values instead
     of going through argparse. Pass exactly one of `want` (a single
     card->qty dict) or `players` (name -> their own card->qty dict, for a
-    group buy). Everything prints as it goes, same as the CLI."""
+    group buy). Everything prints as it goes, same as the CLI.
+
+    Cards fetched within CACHE_TTL of `dump` are reused instead of
+    re-fetched -- prices don't move fast enough within a session to justify
+    re-hitting every source on every run, and it means adding/removing a
+    couple of cards from a decklist only fetches those cards, not the whole
+    thing. --offline skips the network entirely regardless of age; --refresh
+    ignores the cache and treats everything as stale."""
     if not want and not players:
         raise ValueError("run() needs either `want` or `players`")
     sources_util.WARNINGS.clear()  # drop anything left over from a previous run() call
@@ -256,10 +288,29 @@ def run(want: Optional[Dict[str, int]] = None,
         resolved_want = want
 
     if offline:
-        listings, sellers = _load_offline(offline)
+        listings, sellers, _ = _load_offline(offline)
     else:
-        listings, sellers = fetch_everything(resolved_want)
-        _dump(dump, listings, sellers)
+        cached_listings, cached_sellers, fetched_at = [], [], {}
+        if Path(dump).exists() and not refresh:
+            cached_listings, cached_sellers, fetched_at = _load_offline(dump)
+
+        now = time.time()
+        stale = {card for card in resolved_want
+                 if now - fetched_at.get(card, 0) > CACHE_TTL}
+        if stale:
+            fresh_want = {card: resolved_want[card] for card in stale}
+            print(f"\n{len(resolved_want) - len(stale)} of {len(resolved_want)} "
+                  f"card(s) still fresh (cached within {CACHE_TTL // 60} min) -- "
+                  f"fetching {len(stale)}...")
+            fresh_listings, fresh_sellers = fetch_everything(fresh_want)
+            listings, sellers, fetched_at = merge_cache(
+                cached_listings, cached_sellers, fetched_at, stale,
+                fresh_listings, fresh_sellers, now)
+            _dump(dump, listings, sellers, fetched_at)
+        else:
+            print(f"\nall {len(resolved_want)} card(s) already cached within "
+                  f"{CACHE_TTL // 60} min -- skipping fetch (--refresh to force)")
+            listings, sellers = cached_listings, cached_sellers
 
     print(f"\nfetched {len(listings)} active listings across "
           f"{len(sellers)} seller(s)/store(s)")
