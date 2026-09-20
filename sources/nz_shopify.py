@@ -118,13 +118,13 @@ STORES: List[StoreConfig] = [
                 "riftbound-all-singles", shipping=7.50,
                 free_shipping_over=250.0, minimum_order=2.50),
     StoreConfig("CardMasters", "https://cardmasters.co.nz",
-                "riftbound-league-of-legends-singles", shipping_confirmed=False),
+                "riftbound-league-of-legends-singles", shipping=7.00),  # "Courier Post (Singles Only)"
     StoreConfig("IronKnightGaming", "https://ironknightgaming.co.nz",
-                "riftbound-singles-in-stock", shipping_confirmed=False),
+                "riftbound-singles-in-stock", shipping=7.49, minimum_order=4.99),
     StoreConfig("BeaGames", "https://www.beadndgames.co.nz",
-                "riftbound-league-of-legends-singles", shipping_confirmed=False),
+                "riftbound-league-of-legends-singles", shipping=9.00),  # "Flat Rate Shipping Non Rural"
     StoreConfig("ShuffleAndCut", "https://www.shuffleandcutgames.co.nz",
-                "riftbound", shipping_confirmed=False),  # Auckland (Newmarket)
+                "riftbound", shipping=9.00),  # Auckland (Newmarket); no singles in stock currently
 ]
 
 _CARD_NUMBER = re.compile(
