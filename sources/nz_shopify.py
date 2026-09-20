@@ -109,7 +109,7 @@ STORES: List[StoreConfig] = [
     StoreConfig("CardMerchant", "https://cardmerchant.co.nz",
                 "riftbound-singles", shipping=5.00),
     StoreConfig("CardMerchantTakapuna", "https://www.cardmerchanttakapuna.co.nz",
-                "riftbound-singles", shipping=5.00),
+                "riftbound-singles", shipping=0.00),  # local pickup
     StoreConfig("CalicoKeep", "https://www.calicokeep.co.nz",
                 "riftbound-single-in-stock", shipping=5.00),
     StoreConfig("GameRoost", "https://www.gameroost.co.nz",
