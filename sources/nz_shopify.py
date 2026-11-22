@@ -80,6 +80,7 @@ checked and excluded: they only ship to Canada, the US, and the UK.
 
 import re
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -107,7 +108,7 @@ class StoreConfig:
 
 STORES: List[StoreConfig] = [
     StoreConfig("CardMerchant", "https://cardmerchant.co.nz",
-                "riftbound-singles", shipping=5.00),
+                "riftbound-singles", shipping=6.50),
     StoreConfig("CardMerchantTakapuna", "https://www.cardmerchanttakapuna.co.nz",
                 "riftbound-singles", shipping=0.00),  # local pickup
     StoreConfig("CalicoKeep", "https://www.calicokeep.co.nz",
@@ -195,6 +196,13 @@ def _fetch_collection(base_url: str, collection: str) -> Tuple[List[dict], bool]
     return products, True
 
 
+def _seller_for(store: StoreConfig) -> Seller:
+    return Seller(name=store.name, shipping=store.shipping,
+                  free_shipping_over=store.free_shipping_over,
+                  minimum_order=store.minimum_order,
+                  url=f"{store.base_url}/collections/{store.collection}")
+
+
 def _fetch_one_store(store: StoreConfig, want_by_norm: Dict[str, str]) -> Tuple[List[Listing], Optional[Seller]]:
     print(f"  [{store.name}] pulling catalog...")
     products, complete = _fetch_collection(store.base_url, store.collection)
@@ -235,11 +243,7 @@ def _fetch_one_store(store: StoreConfig, want_by_norm: Dict[str, str]) -> Tuple[
 
     if not listings:
         return [], None
-    seller = Seller(name=store.name, shipping=store.shipping,
-                    free_shipping_over=store.free_shipping_over,
-                    minimum_order=store.minimum_order,
-                    url=f"{store.base_url}/collections/{store.collection}")
-    return listings, seller
+    return listings, _seller_for(store)
 
 
 def fetch(want: Dict[str, int]) -> Tuple[List[Listing], List[Seller]]:
@@ -260,4 +264,100 @@ def fetch(want: Dict[str, int]) -> Tuple[List[Listing], List[Seller]]:
         print(f"\n  [{NAME}] shipping is an ESTIMATE (${DEFAULT_SHIPPING_ESTIMATE:.2f}, "
               f"not a confirmed flat rate) for: {', '.join(estimated)}")
 
+    return all_listings, all_sellers
+
+
+# ---------------------------------------------------------------------------
+# Preconstructed champion decks (see precons.py)
+# ---------------------------------------------------------------------------
+#
+# Sealed decks aren't in any store's singles collection, so they're found
+# via Shopify's public predictive-search endpoint instead:
+#
+#     GET {store}/search/suggest.json?q=<set> champion deck&resources[type]=product
+#
+# then each hit's /products/{handle}.js for its variants -- several stores
+# sell one "Origins Champion Decks" product with a Jinx/Lee Sin/Viktor
+# variant each, rather than one product per deck.
+
+PRECON_STOCK_GUESS = 5  # .js only says available or not, same limitation as singles
+_NOT_A_DECK = re.compile(r"(?i)custom|sleeve|playmat|display|case|booster|bundle|chinese|japanese|korean")
+
+
+def _match_precon(product_title: str, variant_title: str, all_precons: list):
+    """The one precon this product/variant is, or None if ambiguous/unknown.
+    Champion is read from the variant title first (e.g. "Vi - Unleashed
+    Champion Deck" under a Vi/Vex product), falling back to the product
+    title for single-deck products ("Default Title" variant). A set name
+    in the text must agree with the precon's, if one is present."""
+    text = f"{product_title} {variant_title}".lower()
+
+    def champs_in(s: str):
+        return [p for p in all_precons
+                if re.search(rf"\b{re.escape(p.champion.lower())}\b", s.lower())]
+
+    hits = champs_in(variant_title) if variant_title.lower() != "default title" else []
+    if not hits:
+        hits = champs_in(product_title)
+    named_sets = {p.set_name.lower() for p in all_precons if p.set_name.lower() in text}
+    hits = [p for p in hits if not named_sets or p.set_name.lower() in named_sets]
+    return hits[0] if len(hits) == 1 else None
+
+
+def fetch_precon_offers(wanted: list, all_precons: list) -> Tuple[List[Listing], List[Seller]]:
+    """Every store's in-stock price for each deck in `wanted` (precons.Precon
+    objects), as Listings of that deck's pseudo-card, plus the Seller for
+    any store that has one -- so a deck and singles from the same store
+    share its shipping. `all_precons` is used only to rule out ambiguous
+    matches (passed in rather than imported, to keep sources/ free of a
+    dependency on the top-level precons module)."""
+    wanted_cards = {p.pseudo_card for p in wanted}
+    sets = sorted({p.set_name for p in wanted})
+    all_listings: List[Listing] = []
+    all_sellers: List[Seller] = []
+
+    for store in STORES:
+        print(f"  [{store.name}] looking for champion decks...")
+        found: List[Listing] = []
+        seen_handles = set()
+        for set_name in sets:
+            q = urllib.parse.quote(f"{set_name} champion deck")
+            try:
+                data = util.get_json(f"{store.base_url}/search/suggest.json?q={q}"
+                                     f"&resources[type]=product&resources[limit]=10")
+            except util.RateLimited:
+                util.warn(f"[{store.name}] RATE LIMITED searching for {set_name} champion "
+                          f"decks -- that store's deck prices are missing from this run.")
+                continue
+            time.sleep(util.REQUEST_DELAY)
+            products = ((data or {}).get("resources", {}).get("results", {}).get("products", []))
+            for prod in products:
+                title = prod.get("title") or ""
+                handle = prod.get("handle")
+                if (not handle or handle in seen_handles or "champion deck" not in title.lower()
+                        or _NOT_A_DECK.search(title)):
+                    continue
+                seen_handles.add(handle)
+                try:
+                    detail = util.get_json(f"{store.base_url}/products/{handle}.js")
+                except util.RateLimited:
+                    continue
+                time.sleep(util.REQUEST_DELAY)
+                for v in (detail or {}).get("variants", []):
+                    if not v.get("available"):
+                        continue
+                    precon = _match_precon(title, v.get("title") or "", all_precons)
+                    if precon is None or precon.pseudo_card not in wanted_cards:
+                        continue
+                    try:
+                        price = float(v["price"]) / 100  # .js prices are integer cents
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if price > 0:
+                        found.append(Listing(card=precon.pseudo_card, seller=store.name,
+                                             price=round(price, 2), stock=PRECON_STOCK_GUESS,
+                                             url=f"{store.base_url}/products/{handle}"))
+        if found:
+            all_listings.extend(found)
+            all_sellers.append(_seller_for(store))
     return all_listings, all_sellers

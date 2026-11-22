@@ -70,6 +70,24 @@ cost-vs-orders sweep (see cart_optimiser.best_from_sweep): no need to guess
 a seller cap yourself. --max-sellers only adds a side-by-side comparison
 against a specific cap, if you want one.
 
+LOCAL PICKUP
+------------
+Some fetchtcg.com sellers turn out to be Auckland-based with a genuine $0
+pickup option (see sources/fetchtcg.py) -- used automatically wherever it
+saves money. Tune or disable this:
+
+    --no-pickup                    # never use pickup, always pay courier
+    --pickup-only Alice,Bob         # only allow pickup from named sellers
+    --pickup-exclude Carl           # allow pickup from everyone except Carl
+    --max-pickups 2                 # at most 2 meetups; the rest ship
+
+CHAMPION DECKS
+--------------
+If a want-list overlaps a preconstructed champion deck enough, buying the
+whole deck from a store can beat buying those cards as singles (mostly by
+saving a shipping fee). This is checked automatically -- see precons.py.
+--no-precons turns it off (and skips fetching deck prices).
+
 Be polite: this is personal use. There's a small delay between requests
 within each source (see sources/util.py).
 """
@@ -80,12 +98,13 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from cart_optimiser import (Listing, Seller, optimise, naive_cheapest_per_card,
+from cart_optimiser import (Listing, Seller, Plan, PickupPolicy, optimise, naive_cheapest_per_card,
                             report, sweep, report_sweep, best_from_sweep)
-from sources import ALL_SOURCES
+from sources import ALL_SOURCES, nz_shopify
 from sources import util as sources_util
 import decklist
 import group_buy
+import precons
 
 # Every source in sources/ALL_SOURCES is on by default -- comment one out
 # to disable it (e.g. if a site is down or you don't want it included).
@@ -119,7 +138,9 @@ def _dump(path: str, listings: List[Listing], sellers: List[Seller],
              "free_shipping_over": s.free_shipping_over,
              "minimum_order": s.minimum_order,
              "shipping_tiers": s.shipping_tiers,
-             "url": s.url}
+             "url": s.url,
+             "pickup_cost": s.pickup_cost,
+             "pickup_note": s.pickup_note}
             for s in sellers
         ],
         "fetched_at": fetched_at,
@@ -140,7 +161,9 @@ def _load_offline(path: str) -> tuple:
                               free_shipping_over=s.get("free_shipping_over"),
                               minimum_order=s.get("minimum_order", 0.0),
                               shipping_tiers=tiers,
-                              url=s.get("url")))
+                              url=s.get("url"),
+                              pickup_cost=s.get("pickup_cost"),
+                              pickup_note=s.get("pickup_note")))
     return listings, sellers, raw.get("fetched_at", {})
 
 
@@ -246,94 +269,169 @@ def main() -> None:
                          "raise this if the cheapest plan might use more "
                          "sellers than that (the sweep table, or a missing "
                          "'cheapest' marker at the last row, will tell you)")
+    ap.add_argument("--no-pickup", action="store_true",
+                    help="never use a seller's free local pickup, even when "
+                         "one is available -- always pay for courier instead")
+    ap.add_argument("--pickup-only", metavar="NAME,NAME,...",
+                    help="only allow pickup from these specific sellers "
+                         "(comma-separated), even if others are eligible")
+    ap.add_argument("--pickup-exclude", metavar="NAME,NAME,...",
+                    help="allow pickup from every eligible seller EXCEPT "
+                         "these (comma-separated)")
+    ap.add_argument("--no-precons", action="store_true",
+                    help="don't consider buying whole preconstructed champion "
+                         "decks instead of some singles (see precons.py)")
+    ap.add_argument("--max-pickups", type=int, metavar="N",
+                    help="cap how many sellers in the chosen plan may use "
+                         "pickup -- the sellers where it saves the most win "
+                         "the slots, the rest ship by courier as normal")
     args = ap.parse_args()
+
+    if args.pickup_only and args.pickup_exclude:
+        raise SystemExit("pass only one of --pickup-only / --pickup-exclude")
+
+    pickup = PickupPolicy(
+        enabled=not args.no_pickup,
+        only_sellers=frozenset(s.strip() for s in args.pickup_only.split(","))
+                     if args.pickup_only else None,
+        exclude_sellers=frozenset(s.strip() for s in args.pickup_exclude.split(","))
+                        if args.pickup_exclude else frozenset(),
+        max_pickups=args.max_pickups,
+    )
 
     players = _resolve_players(args)
     want = None if players else _resolve_want(args)
 
     run(want=want, players=players, offline=args.offline, dump=args.dump,
         max_sellers=args.max_sellers, sweep_to=args.sweep_to, no_sweep=args.no_sweep,
-        refresh=args.refresh)
+        refresh=args.refresh, pickup=pickup, use_precons=not args.no_precons)
 
 
-def run(want: Optional[Dict[str, int]] = None,
-        players: Optional[Dict[str, Dict[str, int]]] = None,
-        offline: Optional[str] = None,
-        dump: str = "listings_cache.json",
-        max_sellers: Optional[int] = None,
-        sweep_to: int = 15,
-        no_sweep: bool = False,
-        refresh: bool = False) -> None:
-    """The actual pipeline, factored out of main() so a GUI (see ui.py) or
-    any other caller can drive it directly with plain Python values instead
-    of going through argparse. Pass exactly one of `want` (a single
-    card->qty dict) or `players` (name -> their own card->qty dict, for a
-    group buy). Everything prints as it goes, same as the CLI.
+def load_listings(resolved_want: Dict[str, int],
+                  offline: Optional[str] = None,
+                  dump: str = "listings_cache.json",
+                  refresh: bool = False,
+                  fetch_precons: bool = True) -> tuple:
+    """The network/cache half of run(), split out so a caller that wants to
+    re-solve the SAME listings under a different PickupPolicy (or a
+    different --max-sellers) can do that without hitting the network or
+    even re-reading the cache file again -- see ui.py's "Re-optimise"
+    button, which just calls solve_and_report() again on whatever this
+    returned last time.
 
     Cards fetched within CACHE_TTL of `dump` are reused instead of
     re-fetched -- prices don't move fast enough within a session to justify
     re-hitting every source on every run, and it means adding/removing a
     couple of cards from a decklist only fetches those cards, not the whole
-    thing. --offline skips the network entirely regardless of age; --refresh
-    ignores the cache and treats everything as stale."""
-    if not want and not players:
-        raise ValueError("run() needs either `want` or `players`")
-    sources_util.WARNINGS.clear()  # drop anything left over from a previous run() call
+    thing. `offline` skips the network entirely regardless of age;
+    `refresh` ignores the cache and treats everything as stale.
 
-    if players:
-        resolved_want = group_buy.pool_players(players)
-        print(f"\npooled {len(players)} players: {len(resolved_want)} unique cards, "
-              f"{sum(resolved_want.values())} total copies needed")
-    else:
-        resolved_want = want
-
+    -> (listings, sellers)."""
     if offline:
         listings, sellers, _ = _load_offline(offline)
-    else:
-        cached_listings, cached_sellers, fetched_at = [], [], {}
-        if Path(dump).exists() and not refresh:
-            cached_listings, cached_sellers, fetched_at = _load_offline(dump)
+        return listings, sellers
 
-        now = time.time()
-        stale = {card for card in resolved_want
-                 if now - fetched_at.get(card, 0) > CACHE_TTL}
-        if stale:
-            fresh_want = {card: resolved_want[card] for card in stale}
-            print(f"\n{len(resolved_want) - len(stale)} of {len(resolved_want)} "
-                  f"card(s) still fresh (cached within {CACHE_TTL // 60} min) -- "
-                  f"fetching {len(stale)}...")
-            fresh_listings, fresh_sellers = fetch_everything(fresh_want)
-            listings, sellers, fetched_at = merge_cache(
-                cached_listings, cached_sellers, fetched_at, stale,
-                fresh_listings, fresh_sellers, now)
-            _dump(dump, listings, sellers, fetched_at)
-        else:
-            print(f"\nall {len(resolved_want)} card(s) already cached within "
-                  f"{CACHE_TTL // 60} min -- skipping fetch (--refresh to force)")
-            listings, sellers = cached_listings, cached_sellers
+    cached_listings, cached_sellers, fetched_at = [], [], {}
+    if Path(dump).exists() and not refresh:
+        cached_listings, cached_sellers, fetched_at = _load_offline(dump)
+
+    # Deck prices are cached exactly like a card's listings, keyed by the
+    # deck's pseudo-card name -- see precons.py.
+    relevant_decks = precons.relevant_precons(resolved_want) if fetch_precons else []
+    tracked = list(resolved_want) + [p.pseudo_card for p in relevant_decks]
+
+    now = time.time()
+    stale = {card for card in tracked if now - fetched_at.get(card, 0) > CACHE_TTL}
+    if stale:
+        stale_cards = {c for c in stale if not precons.is_pseudo(c)}
+        stale_decks = [p for p in relevant_decks if p.pseudo_card in stale]
+        print(f"\n{len(resolved_want) - len(stale_cards)} of {len(resolved_want)} "
+              f"card(s) still fresh (cached within {CACHE_TTL // 60} min) -- "
+              f"fetching {len(stale_cards)}...")
+        fresh_listings, fresh_sellers = [], []
+        if stale_cards:
+            fresh_listings, fresh_sellers = fetch_everything(
+                {card: resolved_want[card] for card in stale_cards})
+        if stale_decks:
+            print(f"\n--- Champion deck prices ({len(stale_decks)} relevant deck(s)) ---")
+            deck_listings, deck_sellers = nz_shopify.fetch_precon_offers(stale_decks, precons.PRECONS)
+            fresh_listings += deck_listings
+            fresh_sellers += deck_sellers
+        listings, sellers, fetched_at = merge_cache(
+            cached_listings, cached_sellers, fetched_at, stale,
+            fresh_listings, fresh_sellers, now)
+        _dump(dump, listings, sellers, fetched_at)
+    else:
+        print(f"\nall {len(resolved_want)} card(s) already cached within "
+              f"{CACHE_TTL // 60} min -- skipping fetch (--refresh to force)")
+        listings, sellers = cached_listings, cached_sellers
 
     print(f"\nfetched {len(listings)} active listings across "
           f"{len(sellers)} seller(s)/store(s)")
+    return listings, sellers
 
+
+def solve_and_report(resolved_want: Dict[str, int],
+                     players: Optional[Dict[str, Dict[str, int]]],
+                     listings: List[Listing],
+                     sellers: List[Seller],
+                     max_sellers: Optional[int] = None,
+                     sweep_to: int = 15,
+                     no_sweep: bool = False,
+                     pickup: PickupPolicy = PickupPolicy(),
+                     use_precons: bool = True) -> Optional[Plan]:
+    """The optimise/report half of run() -- pure computation over an
+    already-fetched (listings, sellers), no network or disk I/O at all.
+    Safe (and fast, typically well under a second) to call repeatedly with
+    just `pickup` or `max_sellers` changed, e.g. to let a GUI apply a new
+    shipping/pickup toggle instantly. Returns the winning Plan (or None) so
+    a caller can inspect it without re-parsing the printed report.
+
+    `pickup` controls whether/how a plan may use a seller's free local
+    pickup instead of courier -- see cart_optimiser.PickupPolicy. Defaults
+    to "use it wherever available".
+
+    `use_precons` also checks whether buying whole champion decks beats
+    singles (see precons.py) -- only possible if load_listings() fetched
+    deck prices. That check adds up to a few seconds per deck worth trying.
+
+    Does NOT clear sources_util.WARNINGS on entry (unlike the old combined
+    run()) -- those are populated during fetching, in load_listings(), so
+    clearing here would wipe out real warnings from THAT call before this
+    one gets a chance to print them. Whoever calls load_listings() is
+    responsible for clearing WARNINGS first; see run() and ui.py."""
     if not listings:
-        return
+        return None
 
     seller_map = {s.name: s for s in sellers}
 
-    report(naive_cheapest_per_card(resolved_want, listings, sellers),
+    report(naive_cheapest_per_card(resolved_want, listings, sellers, pickup=pickup),
            "NAIVE: cheapest listing for every card", seller_map)
 
-    results = sweep(resolved_want, listings, sellers, max_k=sweep_to)
-    best_k, best_plan = best_from_sweep(results)
+    results = sweep(resolved_want, listings, sellers, max_k=sweep_to, pickup=pickup)
+    best_k, singles_plan = best_from_sweep(results)
+
+    deck_plan = None
+    if use_precons:
+        deck_plan, combos = precons.improve_with_precons(
+            resolved_want, listings, sellers, singles_plan, max_sellers=sweep_to, pickup=pickup)
+        precons.report_combos(combos, singles_plan)
+    best_plan = deck_plan or singles_plan
+
     if best_plan is None:
         print("\nno feasible plan found at any seller count")
     else:
         n = len(best_plan.orders)
-        report(best_plan, f"CHEAPEST OVERALL ({n} parcel{'s' if n != 1 else ''})",
-               seller_map)
+        label = f"CHEAPEST OVERALL ({n} parcel{'s' if n != 1 else ''})"
+        if deck_plan is not None:
+            label += f" -- saves ${singles_plan.total - deck_plan.total:.2f} by buying a deck" \
+                if singles_plan else " -- includes a champion deck"
+        report(best_plan, label, seller_map)
 
     if not no_sweep:
         report_sweep(results)
+        if deck_plan is not None:
+            print("  (table above is singles-only -- the cheapest overall plan uses a deck)")
         if best_k == sweep_to:
             print(f"\n  note: the cheapest plan uses every seller count up "
                   f"to --sweep-to ({sweep_to}) -- rerun with a higher "
@@ -341,12 +439,24 @@ def run(want: Optional[Dict[str, int]] = None,
 
     if max_sellers and max_sellers != best_k:
         capped = optimise(resolved_want, listings, sellers,
-                          max_sellers=max_sellers, allow_unfilled=True)
+                          max_sellers=max_sellers, allow_unfilled=True, pickup=pickup)
         report(capped, f"IF CAPPED AT {max_sellers} sellers", seller_map)
 
     if players and best_plan is not None:
-        bills = group_buy.attribute_costs(best_plan, players, seller_map)
-        group_buy.report_bills(bills)
+        # Nobody asked for "[PRECON] ..." itself -- bill the real cards it covers.
+        billable = precons.expand_bundles(best_plan, listings)
+        bills = group_buy.attribute_costs(billable, players, seller_map)
+        solo_costs = group_buy.solo_plan_costs(players, listings, sellers,
+                                               sweep_to=sweep_to, pickup=pickup)
+        fairness_applied = group_buy.apply_individual_rationality(bills, solo_costs)
+        group_buy.sanity_check(billable, bills)
+        group_buy.report_bills(bills, fairness_applied=fairness_applied)
+        if not fairness_applied:
+            print(f"\n  ! Could not guarantee nobody pays more than solo -- pooling "
+                  f"this exact group came out MORE expensive in total than everyone's "
+                  f"solo prices summed (unusual; often means stock contention on a "
+                  f"scarce card). Bills above are the plain proportional split, not "
+                  f"fairness-capped.")
 
     if sources_util.WARNINGS:
         print(f"\n{'!' * 62}\nDATA QUALITY WARNINGS -- prices above may be INCOMPLETE\n{'!' * 62}")
@@ -356,6 +466,45 @@ def run(want: Optional[Dict[str, int]] = None,
               f"rate-limiting), not confirmed absences -- treat the totals above as a "
               f"lower bound until you re-run and this section is empty.")
         sources_util.WARNINGS.clear()
+
+    return best_plan
+
+
+def run(want: Optional[Dict[str, int]] = None,
+        players: Optional[Dict[str, Dict[str, int]]] = None,
+        offline: Optional[str] = None,
+        dump: str = "listings_cache.json",
+        max_sellers: Optional[int] = None,
+        sweep_to: int = 15,
+        no_sweep: bool = False,
+        refresh: bool = False,
+        pickup: PickupPolicy = PickupPolicy(),
+        use_precons: bool = True) -> None:
+    """The actual pipeline, factored out of main() so a GUI (see ui.py) or
+    any other caller can drive it directly with plain Python values instead
+    of going through argparse. Pass exactly one of `want` (a single
+    card->qty dict) or `players` (name -> their own card->qty dict, for a
+    group buy). Everything prints as it goes, same as the CLI.
+
+    Just load_listings() + solve_and_report() back to back -- call those
+    two separately instead if you want to change `pickup` or `max_sellers`
+    afterwards without re-fetching (see their docstrings)."""
+    if not want and not players:
+        raise ValueError("run() needs either `want` or `players`")
+    sources_util.WARNINGS.clear()  # drop anything left over from a previous call
+
+    if players:
+        resolved_want = group_buy.pool_players(players)
+        print(f"\npooled {len(players)} players: {len(resolved_want)} unique cards, "
+              f"{sum(resolved_want.values())} total copies needed")
+    else:
+        resolved_want = want
+
+    listings, sellers = load_listings(resolved_want, offline=offline, dump=dump, refresh=refresh,
+                                      fetch_precons=use_precons)
+    solve_and_report(resolved_want, players, listings, sellers,
+                     max_sellers=max_sellers, sweep_to=sweep_to,
+                     no_sweep=no_sweep, pickup=pickup, use_precons=use_precons)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,32 @@ were found by inspecting the site's own network traffic.
             _NOT_REAL_SHIPPING filters those out. A seller with no genuine
             rate card left falls back to DEFAULT_SHIPPING.
 
+LOCAL PICKUP
+------------
+Each listing carries the seller's own `regionAddress` (city/region,
+country, and an `allowPickups` flag), and a seller's shipping rate card
+often has a genuine $0 "pickup" line alongside their paid courier tiers
+-- e.g. "AUCKLAND PICKUP. CHECK BIO FOR UPCOMING AUCKLAND DATE", $0, no
+card-count limit. fetch_shipping_tiers() normally excludes pickup-ish
+rows via _NOT_REAL_SHIPPING (rightly -- it isn't a *remote* shipping
+option, you can't have $0 delivered to your door), but that meant this
+tool never told you pickup existed at all, even though a large fraction
+of the NZ seller pool turns out to be Auckland-based with
+allowPickups=True. Since the rest of this codebase already assumes an
+Auckland buyer (see nz_shopify.py), sellers whose own regionAddress says
+Auckland AND who publish a $0 pickup tier get that tier added back in
+(as an unrestricted (0, inf, 0.0) shipping_tiers entry) and the resulting
+Seller gets a `pickup_note` cart_optimiser.report() surfaces whenever a
+plan actually lands on $0 shipping for them -- so "$0 shipping" always
+says up front that it means meeting the seller, not a free courier.
+Skipping courier entirely on 3-4 sellers already in a typical plan is a
+real double-digit-dollar saving, not a rounding error.
+
+This only ever records the FACT that a seller offers genuine local
+pickup (Seller.pickup_cost/pickup_note) -- whether a plan actually uses
+it, for which sellers, and how many pickups at once is a policy decision
+made by cart_optimiser.PickupPolicy at solve time, not decided here.
+
 RATE LIMITING
 -------------
 Only the search endpoint is limited: 19 requests succeed, the 20th gets
@@ -47,10 +73,12 @@ Metal, Prize Wall, etc. -- anything with "(" in the card name) are
 excluded as pricier variants of the same card.
 """
 
+import json
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from cart_optimiser import Listing, Seller
 from . import util
@@ -69,8 +97,41 @@ FOIL_OK = True           # include foil listings alongside normal (they play ide
 
 SEARCH_REQUEST_DELAY = 2.5  # see RATE LIMITING above
 
+BUYER_REGION = "auckland"  # see LOCAL PICKUP above -- matches nz_shopify.py's assumption
+
+# A seller's shipping rate card (and whether they offer pickup) changes far
+# less often than card prices/stock do -- there's no reason to re-hit
+# /v1/social/{seller}/shipping for a seller we already have a recent answer
+# for just because some OTHER card's listing went stale and triggered a
+# re-fetch. So this gets its own on-disk cache, decoupled from (and much
+# longer-lived than) fetch_and_optimise.py's per-card CACHE_TTL (1 hour) --
+# see fetch_all_shipping().
+SHIPPING_CACHE_FILE = Path(__file__).resolve().parent.parent / "seller_shipping_cache.json"
+SHIPPING_CACHE_TTL = 24 * 3600  # 1 day
+
 _NOT_REAL_SHIPPING = ("pickup", "pick up", "drop off", "dropoff",
                      "combined", "collect", "local", "bank transfer")
+_PICKUP_WORDS = ("pickup", "pick up", "collect")
+
+
+def _load_shipping_cache() -> Dict[str, dict]:
+    try:
+        return json.loads(SHIPPING_CACHE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_shipping_cache(cache: Dict[str, dict]) -> None:
+    SHIPPING_CACHE_FILE.write_text(json.dumps(cache, indent=2))
+
+
+def _seller_is_local(region_address: Optional[dict]) -> bool:
+    """True if a listing's seller region_address puts them in BUYER_REGION
+    and they've said they're open to pickups at all."""
+    if not region_address or not region_address.get("allowPickups"):
+        return False
+    where = f"{region_address.get('city') or ''} {region_address.get('suburb') or ''}".lower()
+    return BUYER_REGION in where
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +247,13 @@ def fetch_listings_for_id(card_id: str) -> Tuple[List[dict], bool]:
     return rows, True
 
 
-def fetch_all_listings(resolved: Dict[str, List[dict]]) -> List[Listing]:
+def fetch_all_listings(resolved: Dict[str, List[dict]]) -> Tuple[List[Listing], Dict[str, dict]]:
+    """-> (listings, seller_region). seller_region maps sellerProfileName ->
+    that listing's regionAddress dict (same for every listing from one
+    seller), used later to decide who's close enough to offer pickup to --
+    see LOCAL PICKUP above."""
     out: List[Listing] = []
+    seller_region: Dict[str, dict] = {}
     total_ids = sum(len(v) for v in resolved.values())
     done = 0
     incomplete: List[str] = []
@@ -209,21 +275,27 @@ def fetch_all_listings(resolved: Dict[str, List[dict]]) -> List[Listing]:
                     continue
                 out.append(Listing(card=card_name, seller=seller,
                                    price=round(float(price), 2), stock=int(qty)))
+                if seller not in seller_region and row.get("regionAddress"):
+                    seller_region[seller] = row["regionAddress"]
     if incomplete:
         util.warn(f"[{NAME}] RATE LIMITED partway through fetching listings for: "
                  f"{', '.join(incomplete)}. Listings captured before that point are "
                  f"still used, but cheaper ones may exist that this run never saw.")
-    return out
+    return out, seller_region
 
 
 # ---------------------------------------------------------------------------
 # Shipping
 # ---------------------------------------------------------------------------
 
-def fetch_shipping_tiers(seller_name: str) -> Tuple[List[tuple], bool]:
+def fetch_shipping_tiers(seller_name: str) -> Tuple[List[tuple], Optional[str], bool]:
     """A seller's rate card as [(min_cards, max_cards, cost), ...], filtered
     to genuine, non-rural, card-shipping tiers -- cart_optimiser picks the
-    cheapest eligible tier for a given quantity. -> (tiers, complete);
+    cheapest eligible tier for a given quantity. -> (tiers, pickup_title,
+    complete). `pickup_title` is that seller's own title for a real $0
+    pickup row if they publish one (e.g. "AUCKLAND PICKUP..."), independent
+    of whether the caller ends up using it -- see LOCAL PICKUP above for why
+    that's kept separate from `tiers` rather than folded in unconditionally.
     `complete` is False on persistent rate limiting, distinct from a seller
     genuinely having no public rate card (both fall back to
     DEFAULT_SHIPPING, but only the former is wrong rather than absent)."""
@@ -231,19 +303,23 @@ def fetch_shipping_tiers(seller_name: str) -> Tuple[List[tuple], bool]:
     try:
         data = util.get_json(f"{API}/v1/social/{encoded}/shipping")
     except util.RateLimited:
-        return [], False
+        return [], None, False
     if not data:
-        return [], True
+        return [], None, True
     tiers = []
+    pickup_title = None
     for row in data:
         if "Cards" not in row.get("supports", []):
             continue
-        title = row.get("title", "").lower()
-        if not INCLUDE_RURAL and "rural" in title:
-            continue
-        if any(kw in title for kw in _NOT_REAL_SHIPPING):
-            continue
+        title = row.get("title", "")
+        title_lower = title.lower()
         cost = float(row["total"])
+        if pickup_title is None and cost == 0 and any(kw in title_lower for kw in _PICKUP_WORDS):
+            pickup_title = title
+        if not INCLUDE_RURAL and "rural" in title_lower:
+            continue
+        if any(kw in title_lower for kw in _NOT_REAL_SHIPPING):
+            continue
         if cost <= 0:
             continue  # a stated $0 on a real courier line is not credible
         lo = row.get("minCards")
@@ -251,25 +327,73 @@ def fetch_shipping_tiers(seller_name: str) -> Tuple[List[tuple], bool]:
         tiers.append((lo if lo is not None else 0,
                       hi if hi is not None else 10**9,
                       cost))
-    return tiers, True
+    return tiers, pickup_title, True
 
 
-def fetch_all_shipping(seller_names: List[str]) -> Dict[str, List[tuple]]:
+def fetch_all_shipping(seller_names: List[str],
+                       seller_region: Dict[str, dict]) -> Tuple[Dict[str, List[tuple]], Dict[str, str]]:
+    """-> (tiers_by_seller, pickup_title_by_seller). The latter only
+    includes sellers who are both local (see _seller_is_local) AND publish
+    a real $0 pickup row -- it's kept out of tiers_by_seller entirely
+    (rather than injected as a tier) so pickup stays a distinct, optional
+    fact about the seller that callers can choose to use or not, instead
+    of being unconditionally baked into their shipping cost.
+
+    Backed by SHIPPING_CACHE_FILE (TTL: SHIPPING_CACHE_TTL, a day by
+    default) -- a seller whose rate card was fetched recently is served
+    straight from that file, no network call at all, since a shipping
+    policy doesn't change nearly as often as a card's price/stock does.
+    _seller_is_local() is still evaluated fresh every call against the
+    CURRENT seller_region (which comes from this run's own listings, not
+    the cache) since pickup eligibility depends on your want-list's actual
+    matched sellers, not on anything worth caching itself."""
+    cache = _load_shipping_cache()
+    now = time.time()
+
     out: Dict[str, List[tuple]] = {}
+    pickup: Dict[str, str] = {}
+    cache_titles: Dict[str, Optional[str]] = {}
+    to_fetch: List[str] = []
+    for name in seller_names:
+        entry = cache.get(name)
+        if entry and now - entry.get("fetched_at", 0) <= SHIPPING_CACHE_TTL:
+            out[name] = [tuple(t) for t in entry["tiers"]]
+            cache_titles[name] = entry.get("pickup_title")
+        else:
+            to_fetch.append(name)
+
     rate_limited: List[str] = []
-    for i, name in enumerate(seller_names, 1):
-        print(f"  [{NAME}] shipping [{i}/{len(seller_names)}] {name}")
-        tiers, complete = fetch_shipping_tiers(name)
+    for i, name in enumerate(to_fetch, 1):
+        print(f"  [{NAME}] shipping [{i}/{len(to_fetch)}] {name}")
+        tiers, pickup_title, complete = fetch_shipping_tiers(name)
         out[name] = tiers
-        if not complete:
+        cache_titles[name] = pickup_title
+        if complete:
+            cache[name] = {"tiers": tiers, "pickup_title": pickup_title, "fetched_at": now}
+        else:
             rate_limited.append(name)
         time.sleep(util.REQUEST_DELAY)
+    if to_fetch:
+        _save_shipping_cache(cache)
+
+    cached_hits = len(seller_names) - len(to_fetch)
+    if cached_hits:
+        print(f"  [{NAME}] {cached_hits} seller(s)' shipping rates reused from cache "
+              f"(within {SHIPPING_CACHE_TTL // 3600}h), {len(to_fetch)} fetched fresh")
+
+    for name, title in cache_titles.items():
+        if title and _seller_is_local(seller_region.get(name)):
+            pickup[name] = title
+
     if rate_limited:
         util.warn(f"[{NAME}] RATE LIMITED looking up shipping rates for: "
                  f"{', '.join(rate_limited)} -- the ${DEFAULT_SHIPPING:.2f} flat "
                  f"fallback for them is a guess, not a confirmed absence of a public "
                  f"rate card.")
-    return out
+    if pickup:
+        print(f"\n  [{NAME}] {len(pickup)} Auckland-based seller(s) offer real $0 "
+              f"pickup, factored in as an option: {', '.join(sorted(pickup))}")
+    return out, pickup
 
 
 # ---------------------------------------------------------------------------
@@ -281,10 +405,10 @@ def fetch(want: Dict[str, int]) -> Tuple[List[Listing], List[Seller]]:
     if missing:
         print(f"\n  [{NAME}] could not resolve: {', '.join(missing)}")
 
-    listings = fetch_all_listings(resolved)
+    listings, seller_region = fetch_all_listings(resolved)
     seller_names = sorted({l.seller for l in listings})
     print(f"\n  [{NAME}] fetching shipping rates for {len(seller_names)} sellers...")
-    shipping = fetch_all_shipping(seller_names)
+    shipping, pickup = fetch_all_shipping(seller_names, seller_region)
 
     sellers = []
     unresolved_shipping = []
@@ -292,9 +416,20 @@ def fetch(want: Dict[str, int]) -> Tuple[List[Listing], List[Seller]]:
         tiers = shipping.get(name) or []
         if not tiers:
             unresolved_shipping.append(name)
+        pickup_cost = None
+        pickup_note = None
+        if name in pickup:
+            region = seller_region.get(name) or {}
+            where = region.get("city") or BUYER_REGION.title()
+            pickup_cost = 0.0
+            pickup_note = (f"{name} is based in {where} and offers pickup "
+                           f"(\"{pickup[name]}\") -- meet them in person to skip "
+                           f"courier shipping entirely.")
         sellers.append(Seller(name=name, shipping=DEFAULT_SHIPPING,
                               shipping_tiers=tiers or None,
-                              url=f"{SITE}/profiles/{urllib.parse.quote(name, safe='')}"))
+                              url=f"{SITE}/profiles/{urllib.parse.quote(name, safe='')}",
+                              pickup_cost=pickup_cost,
+                              pickup_note=pickup_note))
     if unresolved_shipping:
         print(f"\n  [{NAME}] no public shipping rate for {len(unresolved_shipping)} "
               f"seller(s) (pickup-only or lookup failed) -- using "

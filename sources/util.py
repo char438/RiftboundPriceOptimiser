@@ -78,7 +78,7 @@ def warn(msg: str) -> None:
     card that was never actually checked due to persistent rate-limiting,
     for instance). fetch_and_optimise.run() reprints everything collected
     here as an unmissable banner after the results, then clears the list."""
-    print(f"  ⚠ {msg}")
+    print(f"  ! {msg}")
     WARNINGS.append(msg)
 
 

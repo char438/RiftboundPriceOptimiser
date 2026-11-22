@@ -24,7 +24,21 @@ finds the actual minimum.
   actually cheapest, not just "cheapest if capped at N".
 - **Group buys**: pool multiple people's decklists into one purchase
   (more combined volume amortises shipping further), then splits the
-  cost and shipping back out fairly per person.
+  cost and shipping back out fairly per person -- and guarantees nobody
+  ends up paying MORE than they would have buying entirely alone (see
+  `group_buy.apply_individual_rationality`), capping and rebalancing the
+  split if the proportional attribution would otherwise overcharge
+  someone. A player can also be temporarily excluded from a run (the UI's
+  per-row checkbox) without deleting their pasted decklist.
+- **Champion decks**: checks whether buying a whole preconstructed
+  champion deck (Origins, Spiritforged, Unleashed -- card lists hardcoded
+  in `precons.py`, prices fetched live from the NZ stores) beats buying the
+  overlapping cards as singles, usually by saving a shipping fee. On by
+  default; `--no-precons` / the UI checkbox turns it off.
+- **Local pickup**: a large fraction of Fetch TCG sellers turn out to be
+  Auckland-based with genuine free pickup -- used automatically wherever
+  it saves money, with `--no-pickup` / `--pickup-only` / `--pickup-exclude`
+  / `--max-pickups` to control it (see `cart_optimiser.PickupPolicy`).
 - Imports decklists directly from a
   [riftdecks.com](https://riftdecks.com) export.
 - A minimal desktop GUI (`ui.py`) if you'd rather not use the command line.
@@ -75,7 +89,7 @@ grouped into sections like `MainDeck:`, `Sideboard:`, `Rune Pool:`.
 
 ```
 sources/fetchtcg.py     Fetch TCG marketplace (many sellers)
-sources/nz_shopify.py   single-store NZ retailers (one Seller each)
+sources/nz_shopify.py   single-store NZ retailers, Shopify-based (one Seller each)
         |
         v
 fetch_and_optimise.py   calls fetch(want) on each enabled source,
@@ -105,14 +119,29 @@ They were found by inspecting each site's own network traffic.
 - **Fetch TCG**: a plain JSON API on `api.fetchtcg.com` that the site's
   own frontend calls. See `sources/fetchtcg.py` for the endpoints and
   the measured rate limit.
-- **NZ retailers**: all run Shopify, which exposes a public JSON mirror
-  of any product collection (`/collections/{handle}/products.json`), a
-  standard Shopify feature, not anything site-specific.
+- **NZ retailers** (`sources/nz_shopify.py`): all run Shopify, which
+  exposes a public JSON mirror of any product collection
+  (`/collections/{handle}/products.json`), a standard Shopify feature,
+  not anything site-specific.
 
 Both are read-only, unauthenticated, and rate-limited on this end to be
 a reasonable citizen. That said, this isn't a sanctioned integration
 with either platform, and could break if a site changes its API. Use
 accordingly, and don't hammer it.
+
+## Caching
+
+Two separate caches, deliberately not flushed on the same schedule:
+
+- `listings_cache.json` -- per-card prices/stock, 1 hour TTL
+  (`fetch_and_optimise.CACHE_TTL`). Prices move; this shouldn't be stale
+  for long.
+- `seller_shipping_cache.json` -- a Fetch TCG seller's rate card and
+  pickup status, 24 hour TTL (`sources/fetchtcg.SHIPPING_CACHE_TTL`).
+  Shipping policies barely ever change, so re-fetching one every time
+  some unrelated card's listing goes stale would just be hammering the
+  API for no benefit. Both are gitignored; delete either to force a full
+  re-fetch of that half.
 
 ## Known limitations
 
